@@ -1,265 +1,213 @@
-"""
-WAN 2.1 Image-to-Video RunPod serverless worker.
+"""RunPod serverless worker for WAN video generation models.
 
-Accepted input shapes
-─────────────────────
-Image-to-video generation:
-  {
-    "image": "<URL or data-URI of the source image>",
-    "prompt": "optional motion description",
-    "model":  "wan-i2v-5b" | "wan-i2v-14b-480p" | "wan-i2v-14b-720p",  (default: wan-i2v-5b)
-    "lora":   "filename.safetensors",  (optional – file must be in <MODEL_PATH>/loras/)
-    "width":  832,                     (default: 832)
-    "height": 480,                     (default: 480)
-    "num_frames":          81,         (default: 81, range 1–121)
-    "fps":                 16,         (default: 16)
-    "guidance_scale":      7.5,        (default: 7.5)
-    "num_inference_steps": 30,         (default: 30)
-    "motion_strength":     1.0,        (default: 1.0)
-    "seed":                -1          (default: -1 = random)
-  }
-
-Model pre-download (runs on a pod with a network volume):
-  {
-    "download_models": true,
-    "model": "5b" | "14b-480p" | "14b-720p"   (default: "5b")
-  }
-
-Output
-──────
-  { "video": "data:video/mp4;base64,<...>" }
-  or on error:
-  { "error": "<message>" }
+Supports:
+- Text-to-Video (T2V) via WanPipeline
+- Image-to-Video (I2V) via WanImageToVideoPipeline
 """
 
 import base64
+import io
 import os
 import tempfile
 
-import requests
 import runpod
 import torch
-from PIL import Image
-from io import BytesIO
+from diffusers import WanImageToVideoPipeline, WanPipeline
+from diffusers.utils import export_to_video, load_image
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Supported models
 # ---------------------------------------------------------------------------
-
-MODEL_PATH = os.environ.get("MODEL_PATH", "/runpod-volume/models")
-
-# Maps the user-facing model key to the HuggingFace repo ID and the local
-# directory name under MODEL_PATH.
-MODEL_CONFIG = {
-    "wan-i2v-5b": {
-        "hf_id": "Wan-AI/Wan2.1-I2V-5B",
-        "local": "wan-i2v-5b",
-    },
-    "wan-i2v-14b-480p": {
-        "hf_id": "Wan-AI/Wan2.1-I2V-14B-480P",
-        "local": "wan-i2v-14b-480p",
-    },
-    "wan-i2v-14b-720p": {
-        "hf_id": "Wan-AI/Wan2.1-I2V-14B-720P",
-        "local": "wan-i2v-14b-720p",
-    },
+T2V_MODELS = {
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "Wan-AI/Wan2.1-T2V-14B-Diffusers",
 }
 
-# Lazy pipeline cache – avoids reloading for consecutive jobs with the same model.
-_pipeline_cache: dict = {}
+I2V_MODELS = {
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+}
+
+DEFAULT_T2V_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
 
 # ---------------------------------------------------------------------------
-# Pipeline helpers
+# Global pipeline cache – one pipeline loaded at a time.
 # ---------------------------------------------------------------------------
+_pipeline = None
+_pipeline_model_id = None
 
 
-def _model_source(model_key: str) -> str:
-    """Return local path if already downloaded, otherwise HF repo ID."""
-    cfg = MODEL_CONFIG[model_key]
-    local = os.path.join(MODEL_PATH, cfg["local"])
-    return local if os.path.isdir(local) else cfg["hf_id"]
+def _get_pipeline(model_id: str, task: str):
+    """Load (or return cached) pipeline for *model_id*."""
+    global _pipeline, _pipeline_model_id
+
+    if _pipeline is not None and _pipeline_model_id == model_id:
+        return _pipeline
+
+    # Unload previous pipeline to free VRAM before loading a new one.
+    if _pipeline is not None:
+        del _pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _pipeline = None
+        _pipeline_model_id = None
+
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype})")
+
+    if task == "i2v":
+        pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    else:
+        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype)
+
+    pipe.to(device)
+
+    _pipeline = pipe
+    _pipeline_model_id = model_id
+    return _pipeline
 
 
-def _load_pipeline(model_key: str):
-    """Load (or retrieve from cache) the I2V pipeline for *model_key*."""
-    if model_key in _pipeline_cache:
-        return _pipeline_cache[model_key]
-
-    from diffusers import WanImageToVideoPipeline
-
-    source = _model_source(model_key)
-    print(f"[worker] Loading pipeline from: {source}")
-
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        source,
-        torch_dtype=torch.bfloat16,
-    )
-    pipe.enable_model_cpu_offload()
-    _pipeline_cache[model_key] = pipe
-    return pipe
-
-
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-
-
-def _fetch_image(src: str) -> Image.Image:
-    """Load a PIL Image from a URL or a data-URI."""
-    if src.startswith("data:"):
-        header, b64data = src.split(",", 1)
-        image_bytes = base64.b64decode(b64data)
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
-
-    resp = requests.get(src, timeout=60)
-    resp.raise_for_status()
-    return Image.open(BytesIO(resp.content)).convert("RGB")
-
-
-# ---------------------------------------------------------------------------
-# Video helpers
-# ---------------------------------------------------------------------------
-
-
-def _frames_to_base64(frames: list, fps: int) -> str:
-    """Encode a list of PIL Images as an MP4 and return a base64 data-URI."""
-    import imageio
-    import numpy as np
-
-    np_frames = [np.array(f) for f in frames]
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        imageio.mimsave(
-            tmp_path,
-            np_frames,
-            fps=fps,
-            codec="libx264",
-            quality=8,
-            macro_block_size=1,
-        )
-        with open(tmp_path, "rb") as fh:
-            b64 = base64.b64encode(fh.read()).decode()
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    return f"data:video/mp4;base64,{b64}"
-
-
-# ---------------------------------------------------------------------------
-# Job handlers
-# ---------------------------------------------------------------------------
-
-
-def _generate_i2v(inp: dict) -> dict:
-    """Run image-to-video inference and return base64-encoded MP4."""
-    model_key = inp.get("model", "wan-i2v-5b")
-    if model_key not in MODEL_CONFIG:
-        return {"error": f"Unknown model '{model_key}'. Valid options: {list(MODEL_CONFIG)}"}
-
-    pipe = _load_pipeline(model_key)
-
-    # ---- LoRA ---------------------------------------------------------------
-    lora_name = inp.get("lora")
-    if lora_name:
-        lora_path = os.path.join(MODEL_PATH, "loras", lora_name)
-        if os.path.isfile(lora_path):
-            print(f"[worker] Loading LoRA: {lora_path}")
-            pipe.load_lora_weights(lora_path)
-        else:
-            print(f"[worker] LoRA file not found, skipping: {lora_path}")
-
-    # ---- Source image -------------------------------------------------------
-    image = _fetch_image(inp["image"])
-    width  = int(inp.get("width",  832))
-    height = int(inp.get("height", 480))
-    image  = image.resize((width, height), Image.LANCZOS)
-
-    # ---- Generator ----------------------------------------------------------
-    seed = int(inp.get("seed", -1))
-    generator = None
-    if seed != -1:
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-    # ---- Inference ----------------------------------------------------------
-    output = pipe(
-        image=image,
-        prompt=inp.get("prompt", ""),
-        height=height,
-        width=width,
-        num_frames=int(inp.get("num_frames", 81)),
-        guidance_scale=float(inp.get("guidance_scale", 7.5)),
-        num_inference_steps=int(inp.get("num_inference_steps", 30)),
-        generator=generator,
-    )
-
-    # ---- Unload LoRA so next job starts clean -------------------------------
-    if lora_name:
-        try:
-            pipe.unload_lora_weights()
-        except Exception:
-            pass
-
-    frames = output.frames[0]  # list of PIL Images
-    fps    = int(inp.get("fps", 16))
-    video  = _frames_to_base64(frames, fps)
-    return {"video": video}
-
-
-def _download_models(model_variant: str) -> dict:
-    """Download model weights to the network volume via huggingface_hub."""
-    from huggingface_hub import snapshot_download
-
-    # Normalise variant aliases (e.g. "5b" → "wan-i2v-5b")
-    alias_map = {
-        "5b":       "wan-i2v-5b",
-        "14b-480p": "wan-i2v-14b-480p",
-        "14b-720p": "wan-i2v-14b-720p",
-    }
-    key = alias_map.get(model_variant, model_variant)
-    if key not in MODEL_CONFIG:
-        return {"error": f"Unknown model variant '{model_variant}'"}
-
-    cfg   = MODEL_CONFIG[key]
-    dest  = os.path.join(MODEL_PATH, cfg["local"])
-    os.makedirs(dest, exist_ok=True)
-
-    print(f"[worker] Downloading {cfg['hf_id']} → {dest}")
-    snapshot_download(
-        repo_id=cfg["hf_id"],
-        local_dir=dest,
-        local_dir_use_symlinks=False,
-    )
-    return {"status": "downloaded", "model": key, "path": dest}
-
-
-# ---------------------------------------------------------------------------
-# Main handler
-# ---------------------------------------------------------------------------
+def _encode_video(path: str) -> str:
+    """Return the mp4 at *path* as a base64-encoded string."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
 def handler(job: dict) -> dict:
-    inp = job.get("input", {})
+    """RunPod serverless handler.
 
+    Expected ``job["input"]`` keys:
+        task (str): "t2v" or "i2v". Default: "t2v".
+        model_id (str): HuggingFace model repo ID.
+                        Defaults to DEFAULT_T2V_MODEL / DEFAULT_I2V_MODEL.
+        prompt (str): Text prompt describing the desired video. Required.
+        negative_prompt (str): Optional negative prompt.
+        image (str): Base64-encoded image or URL. Required for "i2v".
+        num_frames (int): Number of frames to generate. Default: 16.
+        height (int): Frame height in pixels. Default: 480.
+        width (int): Frame width in pixels. Default: 832.
+        guidance_scale (float): Classifier-free guidance scale. Default: 5.0.
+        num_inference_steps (int): Denoising steps. Default: 50.
+        seed (int): Random seed for reproducibility. Optional.
+        fps (int): Frames-per-second for the saved video. Default: 16.
+
+    Returns a dict with:
+        video_base64 (str): Base64-encoded mp4 video.
+        seed (int): Seed that was used.
+    """
+    job_input = job.get("input", {})
+
+    # ------------------------------------------------------------------
+    # Parse inputs
+    # ------------------------------------------------------------------
+    task = job_input.get("task", "t2v").lower()
+    if task not in ("t2v", "i2v"):
+        return {"error": f"Unknown task '{task}'. Must be 't2v' or 'i2v'."}
+
+    prompt = job_input.get("prompt")
+    if not prompt:
+        return {"error": "A 'prompt' is required."}
+
+    negative_prompt = job_input.get("negative_prompt", None)
+
+    if task == "i2v":
+        default_model = DEFAULT_I2V_MODEL
+    else:
+        default_model = DEFAULT_T2V_MODEL
+
+    model_id = job_input.get("model_id", default_model)
+
+    # Validate model is known (warn but don't block custom models)
+    known_models = T2V_MODELS | I2V_MODELS
+    if model_id not in known_models:
+        print(f"Warning: model_id '{model_id}' is not in the list of known models.")
+
+    num_frames = int(job_input.get("num_frames", 16))
+    height = int(job_input.get("height", 480))
+    width = int(job_input.get("width", 832))
+    guidance_scale = float(job_input.get("guidance_scale", 5.0))
+    num_inference_steps = int(job_input.get("num_inference_steps", 50))
+    fps = int(job_input.get("fps", 16))
+
+    seed = job_input.get("seed")
+    if seed is not None:
+        seed = int(seed)
+        generator = torch.Generator(
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        ).manual_seed(seed)
+    else:
+        generator = None
+
+    # ------------------------------------------------------------------
+    # Load pipeline
+    # ------------------------------------------------------------------
     try:
-        if inp.get("download_models"):
-            return _download_models(inp.get("model", "5b"))
+        pipe = _get_pipeline(model_id, task)
+    except Exception as exc:
+        return {"error": f"Failed to load model '{model_id}': {exc}"}
 
-        if "image" in inp:
-            return _generate_i2v(inp)
+    # ------------------------------------------------------------------
+    # Build inference kwargs
+    # ------------------------------------------------------------------
+    inference_kwargs = dict(
+        prompt=prompt,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_inference_steps,
+        generator=generator,
+    )
+    if negative_prompt:
+        inference_kwargs["negative_prompt"] = negative_prompt
 
-        return {"error": "Invalid input. Provide 'image' for I2V or 'download_models: true' for setup."}
+    # For I2V tasks, load the conditioning image.
+    if task == "i2v":
+        image_input = job_input.get("image")
+        if not image_input:
+            return {"error": "'image' is required for image-to-video tasks."}
+        try:
+            if image_input.startswith("http://") or image_input.startswith("https://"):
+                image = load_image(image_input)
+            else:
+                image_bytes = base64.b64decode(image_input)
+                image = load_image(io.BytesIO(image_bytes))
+            inference_kwargs["image"] = image
+        except Exception as exc:
+            return {"error": f"Failed to load image: {exc}"}
 
-    except Exception as exc:  # pylint: disable=broad-except
-        import traceback
-        return {"error": str(exc), "traceback": traceback.format_exc()}
+    # ------------------------------------------------------------------
+    # Run inference
+    # ------------------------------------------------------------------
+    try:
+        output = pipe(**inference_kwargs)
+    except Exception as exc:
+        return {"error": f"Inference failed: {exc}"}
+
+    # ------------------------------------------------------------------
+    # Export video and encode to base64
+    # ------------------------------------------------------------------
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(tmp_fd)
+        export_to_video(output.frames[0], tmp_path, fps=fps)
+        video_b64 = _encode_video(tmp_path)
+    except Exception as exc:
+        return {"error": f"Failed to export video: {exc}"}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    result = {"video_base64": video_b64}
+    if seed is not None:
+        result["seed"] = seed
+
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
