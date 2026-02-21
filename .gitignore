@@ -1,5 +1,9 @@
-node_modules/
 .env
-uploads/
-videos/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
 *.log

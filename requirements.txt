@@ -1,0 +1,23 @@
+# RunPod SDK
+runpod>=1.6.2
+
+# PyTorch – install the CUDA build that matches your base image
+# (the Dockerfile pins this via the base image; listed here for reference)
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Hugging Face ecosystem
+diffusers>=0.32.0
+transformers>=4.40.0
+accelerate>=0.30.0
+huggingface_hub>=0.22.0
+safetensors>=0.4.3
+
+# Image / video processing
+Pillow>=10.3.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+numpy>=1.26.0
+
+# HTTP
+requests>=2.31.0
