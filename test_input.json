@@ -1,0 +1,14 @@
+{
+  "input": {
+    "task": "t2v",
+    "prompt": "A cat chasing a butterfly in a sunny backyard, cinematic, 4k",
+    "negative_prompt": "blurry, low quality",
+    "num_frames": 16,
+    "height": 480,
+    "width": 832,
+    "guidance_scale": 5.0,
+    "num_inference_steps": 50,
+    "fps": 16,
+    "seed": 42
+  }
+}
