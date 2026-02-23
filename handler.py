@@ -8,6 +8,7 @@ Supports:
 import base64
 import io
 import os
+import shutil
 import tempfile
 
 import runpod
@@ -33,14 +34,24 @@ I2V_MODELS = {
 DEFAULT_T2V_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers"
 
-# Local /workspace paths written by snapshot_download (via /api/setup).
+# Conservative on-disk requirements used for preflight checks before download.
+# Values include headroom because snapshot_download may use temporary files.
+MODEL_REQUIRED_GB = {
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": 16,
+    "Wan-AI/Wan2.1-T2V-14B-Diffusers": 65,
+    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": 35,
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers": 65,
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers": 65,
+}
+
+# Local /runpod-volume paths written by snapshot_download (via /api/setup).
 # Checked before falling back to HuggingFace download.
 LOCAL_MODEL_PATHS = {
-    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers":    "/workspace/models/wan-t2v-1.3b",
-    "Wan-AI/Wan2.1-T2V-14B-Diffusers":     "/workspace/models/wan-t2v-14b",
-    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": "/workspace/models/wan-i2v-5b",
-    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers":"/workspace/models/wan-i2v-14b-480p",
-    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers":"/workspace/models/wan-i2v-14b-720p",
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers":    "/runpod-volume/models/wan-t2v-1.3b",
+    "Wan-AI/Wan2.1-T2V-14B-Diffusers":     "/runpod-volume/models/wan-t2v-14b",
+    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": "/runpod-volume/models/wan-i2v-5b",
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers":"/runpod-volume/models/wan-i2v-14b-480p",
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers":"/runpod-volume/models/wan-i2v-14b-720p",
 }
 
 # Short aliases accepted from clients (e.g. server.js sends "wan21-i2v-5b").
@@ -57,6 +68,51 @@ MODEL_ALIASES = {
 # ---------------------------------------------------------------------------
 _pipeline = None
 _pipeline_model_id = None
+
+
+def _bytes_to_gb(value: int) -> float:
+    return value / (1024 ** 3)
+
+
+def _model_is_ready(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "model_index.json"))
+
+
+def _download_preflight(hf_repo: str, output_dir: str, required_gb_hint=None):
+    output_dir = os.path.abspath(output_dir)
+    output_parent = os.path.dirname(output_dir) or output_dir
+    os.makedirs(output_parent, exist_ok=True)
+
+    required_gb = required_gb_hint
+    if required_gb is not None:
+        try:
+            required_gb = float(required_gb)
+        except (TypeError, ValueError):
+            required_gb = None
+    if required_gb is None:
+        required_gb = MODEL_REQUIRED_GB.get(hf_repo)
+
+    usage = shutil.disk_usage(output_parent)
+    free_gb = _bytes_to_gb(usage.free)
+
+    if required_gb is None:
+        # Unknown model size: still enforce a small baseline and report free space.
+        required_gb = 10
+
+    if free_gb < required_gb:
+        return {
+            "ok": False,
+            "free_gb": round(free_gb, 2),
+            "required_gb": required_gb,
+            "path": output_parent,
+        }
+
+    return {
+        "ok": True,
+        "free_gb": round(free_gb, 2),
+        "required_gb": required_gb,
+        "path": output_parent,
+    }
 
 
 def _get_pipeline(model_id: str, task: str):
@@ -77,9 +133,12 @@ def _get_pipeline(model_id: str, task: str):
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Prefer locally downloaded copy on /workspace over HuggingFace.
+    # Prefer locally downloaded copy on /runpod-volume over HuggingFace.
     local_path = LOCAL_MODEL_PATHS.get(model_id)
-    load_path = local_path if (local_path and os.path.isdir(local_path)) else model_id
+    local_ready = bool(local_path and _model_is_ready(local_path))
+    if local_path and os.path.isdir(local_path) and not local_ready:
+        print(f"Warning: local model path exists but appears incomplete: {local_path}")
+    load_path = local_path if local_ready else model_id
     print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype}, path={load_path})")
 
     if task == "i2v":
@@ -131,7 +190,7 @@ def handler(job: dict) -> dict:
         available = [
             hf_id
             for hf_id, local_path in LOCAL_MODEL_PATHS.items()
-            if os.path.isdir(local_path)
+            if _model_is_ready(local_path)
         ]
         return {"available_models": available}
 
@@ -142,15 +201,46 @@ def handler(job: dict) -> dict:
         model_config = job_input.get("model_config", {})
         hf_repo = model_config.get("hf_repo")
         output_dir = model_config.get("output_dir")
+        required_gb = model_config.get("required_gb")
         if not hf_repo or not output_dir:
             return {"error": "download_models requires model_config with hf_repo and output_dir"}
+
+        # Skip redownload if the destination already looks complete.
+        if os.path.isdir(output_dir) and _model_is_ready(output_dir):
+            return {"status": "already_downloaded", "hf_repo": hf_repo, "output_dir": output_dir}
+
+        preflight = _download_preflight(hf_repo, output_dir, required_gb)
+        if not preflight["ok"]:
+            return {
+                "error": (
+                    "Insufficient disk space for model download. "
+                    f"Need >= {preflight['required_gb']} GB free on {preflight['path']}, "
+                    f"have {preflight['free_gb']} GB."
+                ),
+                "hint": (
+                    "Attach/expand a larger network volume, choose a smaller model "
+                    "(e.g. wan21-i2v-5b), or clear old models/caches under /runpod-volume/models "
+                    "and /runpod-volume/.cache/huggingface."
+                ),
+            }
+
         try:
             print(f"[download] {hf_repo} → {output_dir}")
             snapshot_download(repo_id=hf_repo, local_dir=output_dir)
             print(f"[download] done: {output_dir}")
             return {"status": "downloaded", "hf_repo": hf_repo, "output_dir": output_dir}
         except Exception as exc:
-            return {"error": f"Download failed: {exc}"}
+            err = str(exc)
+            if "No space left on device" in err:
+                post = _download_preflight(hf_repo, output_dir, required_gb)
+                return {
+                    "error": f"Download failed: {err}",
+                    "hint": (
+                        "Disk is full during download. Free space on /runpod-volume, then retry. "
+                        f"Current free space: {post.get('free_gb')} GB."
+                    ),
+                }
+            return {"error": f"Download failed: {err}"}
 
     # ------------------------------------------------------------------
     # Parse inputs
