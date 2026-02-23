@@ -192,7 +192,21 @@ def handler(job: dict) -> dict:
             for hf_id, local_path in LOCAL_MODEL_PATHS.items()
             if _model_is_ready(local_path)
         ]
-        return {"available_models": available}
+        disk = {}
+        try:
+            st = os.statvfs("/runpod-volume")
+            total_gb = round(st.f_blocks * st.f_frsize / (1024 ** 3), 1)
+            free_gb  = round(st.f_bfree  * st.f_frsize / (1024 ** 3), 1)
+            used_gb  = round(total_gb - free_gb, 1)
+            disk = {
+                "total_gb": total_gb,
+                "used_gb":  used_gb,
+                "free_gb":  free_gb,
+                "used_pct": round(used_gb / total_gb * 100, 1) if total_gb > 0 else 0,
+            }
+        except Exception as exc:
+            disk = {"error": str(exc)}
+        return {"available_models": available, "disk": disk}
 
     # ------------------------------------------------------------------
     # Download mode — triggered by the /api/setup endpoint
