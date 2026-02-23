@@ -115,3 +115,20 @@ result = json.loads(response.text)
 with open("output.mp4", "wb") as f:
     f.write(base64.b64decode(result["output"]["video_base64"]))
 ```
+
+---
+
+## Troubleshooting: "No space left on device"
+
+If you see errors like:
+
+- `No space left on device` while `snapshot_download` is fetching WAN weights
+- `Failed to save job state` after a failed download
+
+then the mounted storage does not have enough free space for the selected model.
+
+Practical guidance:
+
+- `wan21-i2v-5b` needs roughly **35 GB free**.
+- `wan21-i2v-14b-480p` and `wan21-i2v-14b-720p` need roughly **65 GB free**.
+- Clear old artifacts under `/workspace/models` and `/workspace/.cache/huggingface`, or attach a larger network volume.
