@@ -33,6 +33,16 @@ I2V_MODELS = {
 DEFAULT_T2V_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers"
 
+# Local /workspace paths written by snapshot_download (via /api/setup).
+# Checked before falling back to HuggingFace download.
+LOCAL_MODEL_PATHS = {
+    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers":    "/workspace/models/wan-t2v-1.3b",
+    "Wan-AI/Wan2.1-T2V-14B-Diffusers":     "/workspace/models/wan-t2v-14b",
+    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": "/workspace/models/wan-i2v-5b",
+    "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers":"/workspace/models/wan-i2v-14b-480p",
+    "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers":"/workspace/models/wan-i2v-14b-720p",
+}
+
 # Short aliases accepted from clients (e.g. server.js sends "wan21-i2v-5b").
 MODEL_ALIASES = {
     "wan21-t2v-1.3b":    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
@@ -67,12 +77,15 @@ def _get_pipeline(model_id: str, task: str):
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype})")
+    # Prefer locally downloaded copy on /workspace over HuggingFace.
+    local_path = LOCAL_MODEL_PATHS.get(model_id)
+    load_path = local_path if (local_path and os.path.isdir(local_path)) else model_id
+    print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype}, path={load_path})")
 
     if task == "i2v":
-        pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
+        pipe = WanImageToVideoPipeline.from_pretrained(load_path, torch_dtype=dtype)
     else:
-        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype)
+        pipe = WanPipeline.from_pretrained(load_path, torch_dtype=dtype)
 
     pipe.to(device)
 
@@ -110,6 +123,17 @@ def handler(job: dict) -> dict:
         seed (int): Seed that was used.
     """
     job_input = job.get("input", {})
+
+    # ------------------------------------------------------------------
+    # List available models — fast directory check, no pipeline loading
+    # ------------------------------------------------------------------
+    if job_input.get("list_models"):
+        available = [
+            hf_id
+            for hf_id, local_path in LOCAL_MODEL_PATHS.items()
+            if os.path.isdir(local_path)
+        ]
+        return {"available_models": available}
 
     # ------------------------------------------------------------------
     # Download mode — triggered by the /api/setup endpoint
