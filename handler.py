@@ -11,6 +11,7 @@ import os
 import tempfile
 
 import runpod
+from huggingface_hub import snapshot_download
 import torch
 from diffusers import WanImageToVideoPipeline, WanPipeline
 from diffusers.utils import export_to_video, load_image
@@ -109,6 +110,23 @@ def handler(job: dict) -> dict:
         seed (int): Seed that was used.
     """
     job_input = job.get("input", {})
+
+    # ------------------------------------------------------------------
+    # Download mode — triggered by the /api/setup endpoint
+    # ------------------------------------------------------------------
+    if job_input.get("download_models"):
+        model_config = job_input.get("model_config", {})
+        hf_repo = model_config.get("hf_repo")
+        output_dir = model_config.get("output_dir")
+        if not hf_repo or not output_dir:
+            return {"error": "download_models requires model_config with hf_repo and output_dir"}
+        try:
+            print(f"[download] {hf_repo} → {output_dir}")
+            snapshot_download(repo_id=hf_repo, local_dir=output_dir)
+            print(f"[download] done: {output_dir}")
+            return {"status": "downloaded", "hf_repo": hf_repo, "output_dir": output_dir}
+        except Exception as exc:
+            return {"error": f"Download failed: {exc}"}
 
     # ------------------------------------------------------------------
     # Parse inputs
