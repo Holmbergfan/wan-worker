@@ -336,11 +336,15 @@ def handler(job: dict) -> dict:
         image_input = job_input.get("image")
         if not image_input:
             return {"error": "'image' is required for image-to-video tasks."}
+        print(f"[i2v] image type={type(image_input).__name__}, len={len(image_input) if isinstance(image_input, str) else '?'}, starts={repr(image_input[:80]) if isinstance(image_input, str) else '?'}")
         try:
-            if image_input.startswith("http://") or image_input.startswith("https://"):
-                image = load_image(image_input)
+            if isinstance(image_input, str) and image_input.strip().startswith(("http://", "https://")):
+                image = load_image(image_input.strip())
             else:
-                image_bytes = base64.b64decode(image_input)
+                # Assume base64 (strip data URI prefix if present)
+                b64 = image_input if isinstance(image_input, str) else str(image_input)
+                b64 = b64.split(",", 1)[-1] if "," in b64[:64] else b64
+                image_bytes = base64.b64decode(b64)
                 image = load_image(io.BytesIO(image_bytes))
             inference_kwargs["image"] = image
         except Exception as exc:
