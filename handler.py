@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 
+from PIL import Image
 import requests
 import runpod
 from huggingface_hub import snapshot_download
@@ -345,13 +346,13 @@ def handler(job: dict) -> dict:
                 print(f"[i2v] fetch status={resp.status_code}, content-type={resp.headers.get('content-type')}, body_len={len(resp.content)}")
                 if resp.status_code != 200:
                     return {"error": f"Failed to fetch image: HTTP {resp.status_code} — {resp.text[:200]}"}
-                image = load_image(io.BytesIO(resp.content))
+                image = Image.open(io.BytesIO(resp.content)).convert("RGB")
             else:
                 # Assume base64 (strip data URI prefix if present)
                 b64 = image_input if isinstance(image_input, str) else str(image_input)
                 b64 = b64.split(",", 1)[-1] if "," in b64[:64] else b64
                 image_bytes = base64.b64decode(b64)
-                image = load_image(io.BytesIO(image_bytes))
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             inference_kwargs["image"] = image
         except Exception as exc:
             return {"error": f"Failed to load image: {exc}"}
