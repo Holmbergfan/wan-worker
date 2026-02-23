@@ -26,20 +26,20 @@ T2V_MODELS = {
 }
 
 I2V_MODELS = {
-    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers",
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
     "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
 }
 
 DEFAULT_T2V_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers"
+DEFAULT_I2V_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 
 # Conservative on-disk requirements used for preflight checks before download.
 # Values include headroom because snapshot_download may use temporary files.
 MODEL_REQUIRED_GB = {
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": 16,
     "Wan-AI/Wan2.1-T2V-14B-Diffusers": 65,
-    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": 35,
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers": 25,
     "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers": 65,
     "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers": 65,
 }
@@ -49,16 +49,16 @@ MODEL_REQUIRED_GB = {
 LOCAL_MODEL_PATHS = {
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers":    "/runpod-volume/models/wan-t2v-1.3b",
     "Wan-AI/Wan2.1-T2V-14B-Diffusers":     "/runpod-volume/models/wan-t2v-14b",
-    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers": "/runpod-volume/models/wan-i2v-5b",
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers":     "/runpod-volume/models/wan-ti2v-5b",
     "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers":"/runpod-volume/models/wan-i2v-14b-480p",
     "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers":"/runpod-volume/models/wan-i2v-14b-720p",
 }
 
-# Short aliases accepted from clients (e.g. server.js sends "wan21-i2v-5b").
+# Short aliases accepted from clients (e.g. server.js sends "wan22-ti2v-5b").
 MODEL_ALIASES = {
     "wan21-t2v-1.3b":    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     "wan21-t2v-14b":     "Wan-AI/Wan2.1-T2V-14B-Diffusers",
-    "wan21-i2v-5b":      "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers",
+    "wan22-ti2v-5b":     "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     "wan21-i2v-14b-480p":"Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
     "wan21-i2v-14b-720p":"Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
 }
@@ -141,7 +141,9 @@ def _get_pipeline(model_id: str, task: str):
     load_path = local_path if local_ready else model_id
     print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype}, path={load_path})")
 
-    if task == "i2v":
+    # Wan2.2 TI2V models use WanPipeline for both T2V and I2V tasks.
+    # Wan2.1 I2V-only models use WanImageToVideoPipeline.
+    if task == "i2v" and "TI2V" not in model_id:
         pipe = WanImageToVideoPipeline.from_pretrained(load_path, torch_dtype=dtype)
     else:
         pipe = WanPipeline.from_pretrained(load_path, torch_dtype=dtype)
@@ -265,7 +267,7 @@ def handler(job: dict) -> dict:
 
     negative_prompt = job_input.get("negative_prompt", None)
 
-    # Resolve model alias (e.g. "wan21-i2v-5b" -> full HF repo ID).
+    # Resolve model alias (e.g. "wan22-ti2v-5b" -> full HF repo ID).
     raw_model_id = job_input.get("model_id", "")
     model_id = MODEL_ALIASES.get(raw_model_id.lower(), raw_model_id) if raw_model_id else ""
 
