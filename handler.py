@@ -24,12 +24,22 @@ T2V_MODELS = {
 }
 
 I2V_MODELS = {
+    "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers",
     "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
     "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
 }
 
 DEFAULT_T2V_MODEL = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+DEFAULT_I2V_MODEL = "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers"
+
+# Short aliases accepted from clients (e.g. server.js sends "wan21-i2v-5b").
+MODEL_ALIASES = {
+    "wan21-t2v-1.3b":    "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "wan21-t2v-14b":     "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+    "wan21-i2v-5b":      "Wan-AI/Wan2.1-I2V-5B-480P-Diffusers",
+    "wan21-i2v-14b-480p":"Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+    "wan21-i2v-14b-720p":"Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+}
 
 # ---------------------------------------------------------------------------
 # Global pipeline cache – one pipeline loaded at a time.
@@ -103,24 +113,33 @@ def handler(job: dict) -> dict:
     # ------------------------------------------------------------------
     # Parse inputs
     # ------------------------------------------------------------------
-    task = job_input.get("task", "t2v").lower()
-    if task not in ("t2v", "i2v"):
-        return {"error": f"Unknown task '{task}'. Must be 't2v' or 'i2v'."}
-
     prompt = job_input.get("prompt")
     if not prompt:
         return {"error": "A 'prompt' is required."}
 
     negative_prompt = job_input.get("negative_prompt", None)
 
-    if task == "i2v":
-        default_model = DEFAULT_I2V_MODEL
-    else:
-        default_model = DEFAULT_T2V_MODEL
+    # Resolve model alias (e.g. "wan21-i2v-5b" -> full HF repo ID).
+    raw_model_id = job_input.get("model_id", "")
+    model_id = MODEL_ALIASES.get(raw_model_id.lower(), raw_model_id) if raw_model_id else ""
 
-    model_id = job_input.get("model_id", default_model)
+    # Infer task from model when not explicitly provided.
+    task = job_input.get("task", "").lower()
+    if task not in ("t2v", "i2v"):
+        if model_id in I2V_MODELS:
+            task = "i2v"
+        elif model_id in T2V_MODELS:
+            task = "t2v"
+        elif "-i2v-" in model_id.lower():
+            task = "i2v"
+        else:
+            task = "t2v"
 
-    # Validate model is known (warn but don't block custom models)
+    # Fall back to per-task default when no model_id was provided.
+    if not model_id:
+        model_id = DEFAULT_I2V_MODEL if task == "i2v" else DEFAULT_T2V_MODEL
+
+    # Validate model is known (warn but don't block custom models).
     known_models = T2V_MODELS | I2V_MODELS
     if model_id not in known_models:
         print(f"Warning: model_id '{model_id}' is not in the list of known models.")
