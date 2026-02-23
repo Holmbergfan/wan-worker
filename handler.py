@@ -143,9 +143,9 @@ def _get_pipeline(model_id: str, task: str):
     load_path = local_path if local_ready else model_id
     print(f"Loading pipeline: {model_id} (task={task}, dtype={dtype}, path={load_path})")
 
-    # Wan2.2 TI2V models use WanPipeline for both T2V and I2V tasks.
-    # Wan2.1 I2V-only models use WanImageToVideoPipeline.
-    if task == "i2v" and "TI2V" not in model_id:
+    # I2V tasks always need WanImageToVideoPipeline (accepts 'image' kwarg).
+    # T2V tasks use WanPipeline. Both work with TI2V and dedicated models.
+    if task == "i2v":
         pipe = WanImageToVideoPipeline.from_pretrained(load_path, torch_dtype=dtype)
     else:
         pipe = WanPipeline.from_pretrained(load_path, torch_dtype=dtype)
